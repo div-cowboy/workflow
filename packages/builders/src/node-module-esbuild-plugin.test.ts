@@ -20,6 +20,7 @@ import {
   createNodeModuleErrorPlugin,
   escapeRegExp,
   getImportedIdentifier,
+  getImportedIdentifiers,
   getPackageName,
   getViolationLocation,
 } from './node-module-esbuild-plugin.js';
@@ -381,6 +382,49 @@ describe('workflow-node-module-error plugin', () => {
     });
     // Should point to the aliased identifier "read", not "readFile"
     expect(violation.location?.lineText).toContain('read(');
+  });
+
+  // https://github.com/vercel/workflow/issues/5057
+  it('should point at a later named import when the first specifier is unused', async () => {
+    const testCode = `
+      import { readFile, writeFile } from "fs";
+      export function workflow() {
+        return writeFile("test.txt", "ok");
+      }
+    `;
+
+    const { failure, relativeEntry } =
+      await buildWorkflowWithViolation(testCode);
+
+    expect(failure.errors).toHaveLength(1);
+    const violation = failure.errors[0];
+    expect(violation.text).toContain('"fs" which is a Node.js module');
+    expect(violation.location).toMatchObject({
+      file: relativeEntry,
+    });
+    expect(violation.location?.lineText).toContain('writeFile(');
+    expect(violation.location?.lineText).not.toContain('import');
+  });
+
+  it('should point at a later named import when the first specifier is type-only', async () => {
+    const testCode = `
+      import { type Stats, writeFile } from "fs";
+      export function workflow() {
+        return writeFile("test.txt", "ok");
+      }
+    `;
+
+    const { failure, relativeEntry } =
+      await buildWorkflowWithViolation(testCode);
+
+    expect(failure.errors).toHaveLength(1);
+    const violation = failure.errors[0];
+    expect(violation.text).toContain('"fs" which is a Node.js module');
+    expect(violation.location).toMatchObject({
+      file: relativeEntry,
+    });
+    expect(violation.location?.lineText).toContain('writeFile(');
+    expect(violation.location?.lineText).not.toContain('import');
   });
 
   it('should not error when import is unused (tree-shaken)', async () => {
@@ -755,6 +799,29 @@ describe('workflow-node-module-error helper functions', () => {
     });
   });
 
+  describe('getImportedIdentifiers', () => {
+    it('should return every named import and local alias', () => {
+      expect(
+        getImportedIdentifiers('{ readFile, writeFile as write, stat }')
+      ).toEqual(['readFile', 'write', 'stat']);
+    });
+
+    it('should skip inline type-only specifiers but keep `type as` renames', () => {
+      expect(
+        getImportedIdentifiers('{ type Stats, typeof Mode, writeFile }')
+      ).toEqual(['writeFile']);
+      expect(getImportedIdentifiers('{ type as localType }')).toEqual([
+        'localType',
+      ]);
+    });
+
+    it('should handle namespace, default, and empty named imports', () => {
+      expect(getImportedIdentifiers('* as fs')).toEqual(['fs']);
+      expect(getImportedIdentifiers('fs')).toEqual(['fs']);
+      expect(getImportedIdentifiers('{}')).toEqual([]);
+    });
+  });
+
   describe('getImportedIdentifier', () => {
     it('should extract namespace import identifier', () => {
       expect(getImportedIdentifier('* as fs')).toBe('fs');
@@ -864,6 +931,90 @@ describe('workflow-node-module-error helper functions', () => {
       // Since the identifier is never referenced (only imported), we should
       // not produce a location preview.
       expect(location).toBeUndefined();
+    });
+
+    it('should find usage of a later named import when the first is unused', async () => {
+      const tempDir = mkdtempSync(join(realTmpdir, 'violation-location-'));
+      writeFileSync(
+        join(tempDir, 'file.ts'),
+        `import { readFile, writeFile } from "node:fs";
+
+export const value = writeFile;
+`
+      );
+
+      try {
+        const location = await getViolationLocation(
+          tempDir,
+          'file.ts',
+          'node:fs'
+        );
+        expect(location).toEqual({
+          file: 'file.ts',
+          line: 3,
+          column: 'export const value = '.length,
+          lineText: 'export const value = writeFile;',
+          length: 'writeFile'.length,
+        });
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it('should find an aliased later named import', async () => {
+      const tempDir = mkdtempSync(join(realTmpdir, 'violation-location-'));
+      writeFileSync(
+        join(tempDir, 'file.ts'),
+        `import { readFile, writeFile as write } from "node:fs";
+
+export const value = write;
+`
+      );
+
+      try {
+        const location = await getViolationLocation(
+          tempDir,
+          'file.ts',
+          'node:fs'
+        );
+        expect(location).toEqual({
+          file: 'file.ts',
+          line: 3,
+          column: 'export const value = '.length,
+          lineText: 'export const value = write;',
+          length: 'write'.length,
+        });
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it('should skip a leading inline type specifier when locating usage', async () => {
+      const tempDir = mkdtempSync(join(realTmpdir, 'violation-location-'));
+      writeFileSync(
+        join(tempDir, 'file.ts'),
+        `import { type Stats, writeFile } from "node:fs";
+
+export const value = writeFile;
+`
+      );
+
+      try {
+        const location = await getViolationLocation(
+          tempDir,
+          'file.ts',
+          'node:fs'
+        );
+        expect(location).toEqual({
+          file: 'file.ts',
+          line: 3,
+          column: 'export const value = '.length,
+          lineText: 'export const value = writeFile;',
+          length: 'writeFile'.length,
+        });
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
     });
 
     it('should find the usage of a multi-line named import', async () => {
