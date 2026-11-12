@@ -1,10 +1,11 @@
 import type { Queue, Storage, World, WorldCapabilities } from '@workflow/world';
-import { mintedSpecVersion, reenqueueActiveRuns } from '@workflow/world';
+import { mintedSpecVersion } from '@workflow/world';
 import { Pool } from 'pg';
 import { type PostgresWorldConfig, resolveJobPrefix } from './config.js';
 import { handleConnectionErrors } from './connection-errors.js';
 import { createClient, type Drizzle } from './drizzle/index.js';
 import { createQueue } from './queue.js';
+import { reenqueueRecoverableRuns } from './recovery.js';
 import { createRunEventsFeed, type RunEventsFeed } from './run-events.js';
 import {
   createRunStatusListener,
@@ -139,15 +140,18 @@ export function createWorld(
       // Recover only this World's runs (and unstamped legacy ones): every
       // recovered run lands in this World's own task, so a run created under
       // another `jobPrefix` would be driven by the wrong app's runner.
-      await reenqueueActiveRuns(
-        {
+      // Parked runs (unresolved hooks / future waits with no pending wake)
+      // are skipped; recovery jobs use a stable Graphile key so restarts
+      // cannot accumulate duplicates. See recovery.ts and #3119.
+      await reenqueueRecoverableRuns({
+        runs: {
           ...storage.runs,
           list: createRecoverableRunsList(drizzle, jobPrefix),
         },
-        queue.queue,
-        'world-postgres',
-        config.namespace
-      );
+        drizzle,
+        enqueue: queue.queue,
+        namespace: config.namespace,
+      });
     },
     async close() {
       closing = true;

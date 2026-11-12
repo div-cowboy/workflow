@@ -51,6 +51,66 @@ vi.mock('./storage.js', () => ({
   createStepsStorage: vi.fn(),
 }));
 
+// Persisted suspension state consulted by startup recovery (recovery.ts)
+// through the drizzle client. Reset in beforeEach; tests push rows to mark
+// runs as parked (hooks / waits) or runnable (non-terminal steps / wakePending).
+const drizzleState = vi.hoisted(() => ({
+  steps: [] as Array<{ runId: string; status: string }>,
+  waits: [] as Array<{
+    runId: string;
+    status: string;
+    resumeAt: Date | null;
+  }>,
+  hooks: [] as Array<{ runId: string }>,
+  wakePending: [] as string[],
+}));
+
+vi.mock('./drizzle/index.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./drizzle/index.js')>();
+  const Schema = actual.Schema;
+  return {
+    ...actual,
+    createClient: vi.fn(() => ({
+      select: () => ({
+        from: (table: unknown) => ({
+          where: async () => {
+            if (table === Schema.steps) {
+              return drizzleState.steps
+                .filter(
+                  (step) =>
+                    step.status === 'pending' || step.status === 'running'
+                )
+                .map(({ runId }) => ({ runId }));
+            }
+            if (table === Schema.waits) {
+              return drizzleState.waits
+                .filter((wait) => wait.status === 'waiting')
+                .map(({ runId, resumeAt }) => ({ runId, resumeAt }));
+            }
+            if (table === Schema.hooks) {
+              return drizzleState.hooks.map(({ runId }) => ({ runId }));
+            }
+            if (table === Schema.runs) {
+              const pending = new Set(drizzleState.wakePending);
+              const runIds = new Set<string>([
+                ...drizzleState.steps.map((row) => row.runId),
+                ...drizzleState.waits.map((row) => row.runId),
+                ...drizzleState.hooks.map((row) => row.runId),
+                ...pending,
+              ]);
+              return [...runIds].map((runId) => ({
+                runId,
+                wakePending: pending.has(runId),
+              }));
+            }
+            throw new Error('Unexpected table in recovery query');
+          },
+        }),
+      }),
+    })),
+  };
+});
+
 vi.mock('./streamer.js', () => ({
   createStreamer: vi.fn(() => ({
     streams: {
@@ -125,6 +185,10 @@ describe('re-enqueue active runs on start', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    drizzleState.steps = [];
+    drizzleState.waits = [];
+    drizzleState.hooks = [];
+    drizzleState.wakePending = [];
     runnerMock.promise = Promise.resolve();
     vi.mocked(makeWorkerUtils).mockResolvedValue(workerUtilsMock);
     vi.mocked(getWorkflowPort).mockResolvedValue(undefined);
@@ -310,6 +374,76 @@ describe('re-enqueue active runs on start', () => {
     );
 
     await world.close();
+  });
+
+  it('skips runs durably parked on hooks or future waits during startup recovery', async () => {
+    mockRunsList({
+      running: [
+        { runId: 'wrun_hooked', workflowName: 'wfHook' },
+        { runId: 'wrun_sleeping', workflowName: 'wfSleep' },
+        { runId: 'wrun_active', workflowName: 'wfActive' },
+      ],
+    });
+    drizzleState.hooks.push({ runId: 'wrun_hooked' });
+    drizzleState.waits.push({
+      runId: 'wrun_sleeping',
+      status: 'waiting',
+      resumeAt: new Date(Date.now() + 60 * 60 * 1000),
+    });
+    drizzleState.steps.push({ runId: 'wrun_active', status: 'running' });
+
+    const world = createWorld({ connectionString: 'postgres://test', pool });
+    await world.start();
+
+    expect(workerUtilsMock.addJob).toHaveBeenCalledTimes(1);
+    expect(workerUtilsMock.addJob).toHaveBeenCalledWith(
+      'workflow_flows',
+      expect.objectContaining({ id: 'wfActive' }),
+      expect.anything()
+    );
+
+    await world.close();
+  });
+
+  it('recovers a hook-parked run when wake_pending is set', async () => {
+    mockRunsList({
+      running: [{ runId: 'wrun_wake', workflowName: 'wfWake' }],
+    });
+    drizzleState.hooks.push({ runId: 'wrun_wake' });
+    drizzleState.wakePending.push('wrun_wake');
+
+    const world = createWorld({ connectionString: 'postgres://test', pool });
+    await world.start();
+
+    expect(workerUtilsMock.addJob).toHaveBeenCalledTimes(1);
+    expect(workerUtilsMock.addJob).toHaveBeenCalledWith(
+      'workflow_flows',
+      expect.objectContaining({ id: 'wfWake' }),
+      expect.objectContaining({ jobKey: 'startup-recovery:wrun_wake' })
+    );
+
+    await world.close();
+  });
+
+  it('recovers runs with a stable graphile job key so repeated boots do not accumulate duplicate jobs', async () => {
+    mockRunsList({
+      pending: [{ runId: 'wrun_AAA', workflowName: 'wfA' }],
+    });
+
+    const world1 = createWorld({ connectionString: 'postgres://test', pool });
+    await world1.start();
+    await world1.close();
+
+    const world2 = createWorld({ connectionString: 'postgres://test', pool });
+    await world2.start();
+    await world2.close();
+
+    expect(workerUtilsMock.addJob).toHaveBeenCalledTimes(2);
+    const jobKeys = vi
+      .mocked(workerUtilsMock.addJob)
+      .mock.calls.map((call) => (call[2] as { jobKey?: string })?.jobKey);
+    expect(jobKeys[0]).toBe('startup-recovery:wrun_AAA');
+    expect(jobKeys[1]).toBe('startup-recovery:wrun_AAA');
   });
 
   it('does not enqueue anything when there are no active runs', async () => {

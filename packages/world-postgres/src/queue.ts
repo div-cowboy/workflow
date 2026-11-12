@@ -117,8 +117,8 @@ const graphileLogger = createGraphileLogger();
  * the workflow body inline, so response headers arrive only once that work is
  * done, and a bound here declares a slow-but-healthy delivery crashed and
  * redelivers it while the original is still running (two executions of the
- * same steps). Crash recovery does not need one: `reenqueueActiveRuns`
- * re-enqueues active runs on start, and a running delivery renews its job
+ * same steps). Crash recovery does not need one: `reenqueueRecoverableRuns`
+ * re-enqueues runnable runs on start, and a running delivery renews its job
  * lock while any other process releases a job whose lock goes unrenewed
  * (because its process died), and the lock of its named queue, for
  * redelivery (see `job-lease.ts`). By default that release covers only the
@@ -1059,7 +1059,10 @@ export function createQueue(
       idempotencyKey: opts?.idempotencyKey,
       headers: opts?.headers,
       delaySeconds: opts?.delaySeconds,
-      jobKey: opts?.idempotencyKey ?? messageId,
+      // `jobKey` is a Graphile identity only: recovery uses it without
+      // setting `idempotencyKey`, so the delivery stays on the unkeyed
+      // path (per-run serialization, no completed-message LRU).
+      jobKey: opts?.jobKey ?? opts?.idempotencyKey ?? messageId,
       jobKeyMode: jobKeyModeFor(message, opts?.idempotencyKey),
       // Only the SDK's own prefix carries workflow runs; a queue consumer's
       // own messages are never serialized by run.
@@ -1416,6 +1419,20 @@ export function createQueue(
         }
 
         if (result.type === 'completed') {
+          // The orchestrator has consumed whatever wake this delivery was
+          // for (or parked without one). Clear the checkpoint so a later
+          // restart does not re-enqueue a run that is now durably parked.
+          // Step deliveries and wait-timer hops are not orchestrator
+          // deliveries (`orchestratorRunIdOf` is undefined) and leave it.
+          const completedRunId = orchestratorRunIdOf(body);
+          if (completedRunId) {
+            await pool.query(
+              `UPDATE workflow.workflow_runs
+               SET wake_pending = false
+               WHERE id = $1 AND wake_pending IS TRUE`,
+              [completedRunId]
+            );
+          }
           return 'completed';
         }
 

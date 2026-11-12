@@ -928,6 +928,15 @@ export interface QueueOptions {
    */
   idempotencyKey?: string;
   /**
+   * Durable identity of the queue job, independent of {@link idempotencyKey}.
+   * `@workflow/world-postgres` uses this as graphile-worker's `jobKey`
+   * without copying it onto the message, so startup recovery can replace an
+   * outstanding recovery job across restarts without routing the delivery
+   * through the message-level idempotency path. Worlds that have no native
+   * job identity ignore this field.
+   */
+  jobKey?: string;
+  /**
    * How long the message may live, in seconds, including every redelivery.
    * Set on step messages so that the message outlives its step's whole retry
    * span (the step is retried in place on the same message). A World caps it

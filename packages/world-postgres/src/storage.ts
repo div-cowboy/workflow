@@ -117,6 +117,19 @@ import { compact } from './util.js';
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 /**
+ * Events that require a subsequent orchestrator delivery. Written onto
+ * `workflow_runs.wake_pending` in the same transaction as the event so
+ * startup recovery can tell an unconsumed wake from a durably parked run.
+ */
+const ORCHESTRATOR_WAKE_EVENT_TYPES = new Set<Event['eventType']>([
+  'hook_received',
+  'wait_completed',
+  'step_completed',
+  'step_failed',
+  'hook_disposed',
+]);
+
+/**
  * A drizzle handle, either the pool or a transaction. Slot allocation runs on
  * whichever one the caller is already inside, so the position an insert takes
  * commits or rolls back with the insert itself.
@@ -494,6 +507,12 @@ async function insertEventRow(
           });
     if (row) {
       if (fenced) fenced.consumed = true;
+      if (ORCHESTRATOR_WAKE_EVENT_TYPES.has(values.eventType)) {
+        await db
+          .update(Schema.runs)
+          .set({ wakePending: true })
+          .where(eq(Schema.runs.runId, runId));
+      }
       return row;
     }
     if (fenced && !(await revertFenceAdvance(db, fenced))) {
@@ -775,8 +794,14 @@ function parseErrorJson(_errorJson: string | null): SerializedData | null {
  */
 function deserializeRunError(run: any): WorkflowRun {
   // Drop any stale legacy-only fields we might still encounter on read, and
-  // the internal `jobPrefix` routing column, which is not part of a run.
-  const { errorStack: _errorStack, jobPrefix: _jobPrefix, ...rest } = run;
+  // the internal `jobPrefix` / `wakePending` columns, which are not part of
+  // a run.
+  const {
+    errorStack: _errorStack,
+    jobPrefix: _jobPrefix,
+    wakePending: _wakePending,
+    ...rest
+  } = run;
   return rest as WorkflowRun;
 }
 
