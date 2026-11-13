@@ -1,6 +1,6 @@
 import { copyFileSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { copyFile, mkdir, readFile } from 'node:fs/promises';
-import { dirname, isAbsolute, join } from 'node:path';
+import { dirname, isAbsolute, join, win32 } from 'node:path';
 import {
   generatedWorkflowPathPattern,
   resolveConfiguredProjectRoot,
@@ -83,6 +83,20 @@ function getWorkflowBuilds(): Map<string, Promise<void>> {
     Record<symbol, Map<string, Promise<void>> | undefined>;
   globalWithBuilds[WORKFLOW_BUILDS_SYMBOL] ??= new Map();
   return globalWithBuilds[WORKFLOW_BUILDS_SYMBOL];
+}
+
+/**
+ * Next.js CLI helpers that load `next.config` only to read fields like
+ * `distDir`. They inherit `NODE_ENV=development` from `next dev` and
+ * evaluate the config in `PHASE_DEVELOPMENT_SERVER`, so a NODE_ENV-keyed
+ * watcher would start here and never be closed.
+ * See https://github.com/vercel/workflow/issues/4470
+ *
+ * `win32.basename` treats both `/` and `\` as separators, so a Windows
+ * `argv[1]` still matches.
+ */
+function isNextConfigHelperProcess(): boolean {
+  return win32.basename(process.argv[1] ?? '') === 'detached-flush.js';
 }
 
 // Keep this local: @workflow/next is CommonJS, while @workflow/utils is ESM-only.
@@ -635,7 +649,14 @@ export function withWorkflow(
       : resolveProjectRoot(workingDir);
     const supportsTurboCondition = semver.gte(nextVersion, 'v16.0.0');
 
-    const shouldWatch = process.env.NODE_ENV === 'development';
+    // Watch mode belongs to the long-lived `next dev` server, not to every
+    // process that evaluates next.config with NODE_ENV=development. Next's
+    // telemetry helper (`detached-flush.js`) loads the config in
+    // PHASE_DEVELOPMENT_SERVER to read distDir; starting the eager builder's
+    // watcher there holds the process open (350–600 MB per `next dev` stop).
+    const isConfigHelperProcess = isNextConfigHelperProcess();
+    const shouldWatch =
+      phase === 'phase-development-server' && !isConfigHelperProcess;
     let workflowBuilderPromise: Promise<any> | undefined;
     const distDir = nextConfig.distDir || '.next';
 
@@ -758,10 +779,12 @@ export function withWorkflow(
         : webpackConfig;
     };
     // only run this in the main process so it only runs once
-    // as Next.js uses child processes for different builds
+    // as Next.js uses child processes for different builds.
+    // Config-only helpers (Next telemetry detached-flush) only need distDir.
     if (
       !process.env.WORKFLOW_NEXT_PRIVATE_BUILT &&
-      phase !== 'phase-production-server'
+      phase !== 'phase-production-server' &&
+      !isConfigHelperProcess
     ) {
       const builds = getWorkflowBuilds();
       let build = builds.get(workingDir);

@@ -1,3 +1,4 @@
+import { execFile } from 'node:child_process';
 import {
   existsSync,
   mkdirSync,
@@ -9,8 +10,11 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { promisify } from 'node:util';
 import { turbopackContentPattern } from '@workflow/builders';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const execFileAsync = promisify(execFile);
 
 const {
   buildMock,
@@ -60,8 +64,10 @@ function writeFile(path: string, contents: string): void {
 
 describe('withWorkflow builder config', () => {
   const originalCwd = process.cwd();
+  const originalArgv1 = process.argv[1];
   const originalEnv = {
     PORT: process.env.PORT,
+    NODE_ENV: process.env.NODE_ENV,
     VERCEL_DEPLOYMENT_ID: process.env.VERCEL_DEPLOYMENT_ID,
     WORKFLOW_LOCAL_DATA_DIR: process.env.WORKFLOW_LOCAL_DATA_DIR,
     WORKFLOW_NEXT_PRIVATE_BUILT: process.env.WORKFLOW_NEXT_PRIVATE_BUILT,
@@ -95,6 +101,8 @@ describe('withWorkflow builder config', () => {
     if (process.cwd() !== originalCwd) {
       process.chdir(originalCwd);
     }
+
+    process.argv[1] = originalArgv1;
 
     for (const [key, value] of Object.entries(originalEnv)) {
       if (value === undefined) {
@@ -210,6 +218,164 @@ describe('withWorkflow builder config', () => {
     await config('phase-production-server', { defaultConfig: {} });
 
     expect(prewarmWorkflowSwcPluginCacheMock).not.toHaveBeenCalled();
+  });
+
+  describe('dev watcher', () => {
+    function mockWatchHoldingBuilder() {
+      let hold: ReturnType<typeof setInterval> | undefined;
+      getNextBuilderMock.mockImplementationOnce(async () => {
+        return class MockNextBuilder {
+          build = buildMock;
+
+          constructor(config: Record<string, unknown>) {
+            builderConfigs.push(config);
+            if (config.watch) {
+              hold = setInterval(() => {}, 60_000);
+            }
+          }
+        };
+      });
+      return {
+        stop() {
+          if (hold) {
+            clearInterval(hold);
+            hold = undefined;
+          }
+        },
+        get held() {
+          return hold !== undefined;
+        },
+      };
+    }
+
+    it('enables watch mode for the development server regardless of NODE_ENV', async () => {
+      process.env.NODE_ENV = 'test';
+      process.argv[1] = join(
+        'node_modules',
+        'next',
+        'dist',
+        'server',
+        'lib',
+        'start-server.js'
+      );
+
+      await withWorkflow({})('phase-development-server', {
+        defaultConfig: {},
+      });
+
+      expect(builderConfigs).toHaveLength(1);
+      expect(builderConfigs[0].watch).toBe(true);
+    });
+
+    it('does not enable watch mode during a production build with NODE_ENV=development', async () => {
+      process.env.NODE_ENV = 'development';
+
+      await withWorkflow({})('phase-production-build', { defaultConfig: {} });
+
+      expect(builderConfigs).toHaveLength(1);
+      expect(builderConfigs[0].watch).toBe(false);
+    });
+
+    it('does not start the eager builder when Next telemetry detached-flush evaluates the config', async () => {
+      const holding = mockWatchHoldingBuilder();
+      process.env.NODE_ENV = 'development';
+      process.argv[1] = join(
+        'node_modules',
+        'next',
+        'dist',
+        'telemetry',
+        'detached-flush.js'
+      );
+
+      try {
+        const nextConfig = await withWorkflow({ distDir: 'out' })(
+          'phase-development-server',
+          { defaultConfig: {} }
+        );
+
+        expect(getNextBuilderMock).not.toHaveBeenCalled();
+        expect(buildMock).not.toHaveBeenCalled();
+        expect(builderConfigs).toHaveLength(0);
+        expect(holding.held).toBe(false);
+        expect(nextConfig.distDir).toBe('out');
+        expect(process.env.WORKFLOW_NEXT_PRIVATE_BUILT).toBeUndefined();
+      } finally {
+        holding.stop();
+      }
+    });
+
+    it('recognizes a Windows path to detached-flush.js as a config helper', async () => {
+      process.env.NODE_ENV = 'development';
+      process.argv[1] =
+        'C:\\project\\node_modules\\next\\dist\\telemetry\\detached-flush.js';
+
+      await withWorkflow({})('phase-development-server', {
+        defaultConfig: {},
+      });
+
+      expect(getNextBuilderMock).not.toHaveBeenCalled();
+      expect(builderConfigs).toHaveLength(0);
+    });
+
+    it('a detached-flush-like process evaluating withWorkflow exits', async () => {
+      const packageRoot = join(__dirname, '..');
+      const distIndex = join(packageRoot, 'dist', 'index.js');
+      const tsc = require.resolve('typescript/bin/tsc', {
+        paths: [packageRoot],
+      });
+      await execFileAsync(process.execPath, [tsc], {
+        cwd: packageRoot,
+      });
+
+      const childDir = mkdtempSync(join(realTmpDir, 'wf-detached-flush-'));
+      const childPath = join(childDir, 'detached-flush.js');
+      writeFileSync(
+        childPath,
+        `'use strict';
+process.env.NODE_ENV = 'development';
+const Module = require('module');
+const origLoad = Module._load;
+Module._load = function (request, parent, isMain) {
+  if (request === './builder.js' || request === './builder') {
+    return {
+      getNextBuilder: async () =>
+        class {
+          constructor(config) {
+            if (config.watch) {
+              setInterval(() => {}, 1000);
+            }
+          }
+          async build() {}
+        },
+    };
+  }
+  return origLoad.apply(this, arguments);
+};
+const { withWorkflow } = require(${JSON.stringify(distIndex)});
+withWorkflow({})('phase-development-server', { defaultConfig: {} }).catch(
+  (err) => {
+    console.error(err);
+    process.exit(1);
+  }
+);
+`
+      );
+
+      try {
+        const { stdout, stderr } = await execFileAsync(
+          process.execPath,
+          [childPath],
+          {
+            cwd: packageRoot,
+            timeout: 10_000,
+            encoding: 'utf8',
+          }
+        );
+        expect(stderr, stdout).toBe('');
+      } finally {
+        rmSync(childDir, { recursive: true, force: true });
+      }
+    });
   });
 
   it('configures diagnostics inside the default Next.js dist dir', async () => {
